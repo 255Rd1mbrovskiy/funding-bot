@@ -19,11 +19,16 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
+# трохи приглушимо шум від бібліотек
+for name in ["telegram", "telegram.ext", "httpx", "aiohttp", "urllib3", "asyncio"]:
+    logging.getLogger(name).setLevel(logging.WARNING)
+
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
+# ---------- ENDPOINTS ----------
 BINANCE_PREMIUM = "https://fapi.binance.com/fapi/v1/premiumIndex"
-
+FUTURES_24H = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 
 # ---------- УТИЛІТИ ----------
 def parse_interval(text: str) -> int | None:
@@ -37,15 +42,33 @@ def parse_interval(text: str) -> int | None:
 
 
 async def fetch_binance(symbol: str):
+    """
+    Повертає: (SYMBOL, funding_rate_decimal, next_dt_kyiv, mark_price)
+    """
     params = {"symbol": symbol.upper()}
     async with aiohttp.ClientSession() as s:
         async with s.get(BINANCE_PREMIUM, params=params, timeout=12) as r:
             r.raise_for_status()
             data = await r.json()
     rate = float(data.get("lastFundingRate") or data.get("fundingRate") or 0.0)
-    # Kyiv = UTC+3 (спрощено, без zoneinfo)
+    # спростимо зсув для Києва без zoneinfo
     next_dt = datetime.fromtimestamp(int(data["nextFundingTime"]) / 1000, tz=timezone.utc) + timedelta(hours=3)
-    return symbol.upper(), rate, next_dt
+    mark_price = float(data.get("markPrice") or 0.0)
+    return symbol.upper(), rate, next_dt, mark_price
+
+
+async def fetch_futures_24h(symbol: str):
+    """
+    Повертає: (last_price, change_pct) для USDT-маржин ф’ючерсів.
+    """
+    params = {"symbol": symbol.upper()}
+    async with aiohttp.ClientSession() as s:
+        async with s.get(FUTURES_24H, params=params, timeout=12) as r:
+            r.raise_for_status()
+            data = await r.json()
+    last = float(data.get("lastPrice") or 0.0)
+    chg = float(data.get("priceChangePercent") or 0.0)  # у відсотках
+    return last, chg
 
 
 # ---------- КОМАНДИ ----------
@@ -73,10 +96,16 @@ async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     symbol = context.args[0]
     try:
-        sym, rate, next_dt = await fetch_binance(symbol)
+        sym, rate, next_dt, mark = await fetch_binance(symbol)
+        last, chg = await fetch_futures_24h(sym)
+        price = last or mark
+        arrow = "🔺" if chg >= 0 else "🔻"
         await update.message.reply_text(
-            f"📌 {sym}\nFunding: {rate*100:.6f}% ({rate:.10f})\n"
-            f"Next (Kyiv): {next_dt:%Y-%m-%d %H:%M:%S}"
+            f"📌 {sym}\n"
+            f"Funding: {rate*100:.6f}% ({rate:.10f})\n"
+            f"Next (Kyiv): {next_dt:%Y-%m-%d %H:%M:%S}\n"
+            f"Price: ${price:,.4f}\n"
+            f"24h: {arrow} {chg:.2f}%"
         )
     except Exception as e:
         logging.exception("rate_cmd error")
@@ -88,15 +117,22 @@ async def alarm_tick(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     symbol = context.job.data["symbol"]
     try:
-        sym, rate, next_dt = await fetch_binance(symbol)
+        sym, rate, next_dt, mark = await fetch_binance(symbol)
+        last, chg = await fetch_futures_24h(sym)
+        price = last or mark
+        arrow = "🔺" if chg >= 0 else "🔻"
         await context.bot.send_message(
             chat_id,
-            f"⏰ Funding update\n📌 {sym}\nFunding: {rate*100:.6f}% ({rate:.10f})\n"
-            f"Next (Kyiv): {next_dt:%Y-%m-%d %H:%M:%S}"
+            f"⏰ Funding update\n"
+            f"📌 {sym}\n"
+            f"Funding: {rate*100:.6f}% ({rate:.10f})\n"
+            f"Next (Kyiv): {next_dt:%Y-%m-%d %H:%M:%S}\n"
+            f"Price: ${price:,.4f}\n"
+            f"24h: {arrow} {chg:.2f}%"
         )
     except Exception as e:
         logging.exception("alarm_tick error")
-        await context.bot.send_message(chat_id, f"Помилка отримання funding для {symbol}: {e}")
+        await context.bot.send_message(chat_id, f"Помилка отримання даних для {symbol}: {e}")
 
 
 async def alarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -123,6 +159,7 @@ async def alarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=name,
         data={"symbol": symbol},
     )
+    logging.info(f"Alarm started: chat={update.effective_chat.id}, {symbol}, every {context.args[1]}")
     await update.message.reply_text(f"✅ Запущено аларм для {symbol} кожні {context.args[1]}.\nЗупинка: /stopalarm {symbol}")
 
 
@@ -135,6 +172,7 @@ async def stopalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for j in jobs:
             j.schedule_removal()
         msg = f"🛑 Зупинено аларм для {symbol}." if jobs else f"Не знайдено активного аларму для {symbol}."
+        logging.info(f"Alarm stopped: chat={update.effective_chat.id}, {symbol}")
     else:
         cnt = 0
         for j in list(jq.jobs()):
@@ -142,6 +180,7 @@ async def stopalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 j.schedule_removal()
                 cnt += 1
         msg = f"🛑 Зупинено {cnt} аларм(и)." if cnt else "Активних алармів не знайдено."
+        logging.info(f"All alarms stopped: chat={update.effective_chat.id}, count={cnt}")
     await update.message.reply_text(msg)
 
 
