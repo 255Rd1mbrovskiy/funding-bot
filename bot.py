@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
@@ -15,7 +14,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ---------- базові налаштування ----------
+# ---------- ЛОГИ + ТОКЕН ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -25,7 +24,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 BINANCE_PREMIUM = "https://fapi.binance.com/fapi/v1/premiumIndex"
 
-# ---------- утиліти ----------
+
+# ---------- УТИЛІТИ ----------
 def parse_interval(text: str) -> int | None:
     """'30s'->30, '30m'->1800, '1h'->3600"""
     m = re.fullmatch(r"\s*(\d+)\s*([smhSMH])\s*", text)
@@ -35,32 +35,37 @@ def parse_interval(text: str) -> int | None:
     unit = m.group(2).lower()
     return n if unit == "s" else n * 60 if unit == "m" else n * 3600
 
+
 async def fetch_binance(symbol: str):
-    url = BINANCE_PREMIUM
     params = {"symbol": symbol.upper()}
     async with aiohttp.ClientSession() as s:
-        async with s.get(url, params=params, timeout=12) as r:
+        async with s.get(BINANCE_PREMIUM, params=params, timeout=12) as r:
             r.raise_for_status()
             data = await r.json()
     rate = float(data.get("lastFundingRate") or data.get("fundingRate") or 0.0)
-    # Kyiv = UTC+3 у прикладі (спростимо без zoneinfo)
+    # Kyiv = UTC+3 (спрощено, без zoneinfo)
     next_dt = datetime.fromtimestamp(int(data["nextFundingTime"]) / 1000, tz=timezone.utc) + timedelta(hours=3)
     return symbol.upper(), rate, next_dt
 
-# ---------- команди ----------
-async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
+
+# ---------- КОМАНДИ ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 Привіт!\n\n"
         "Команди:\n"
-        "• /rate SYMBOL — поточний funding з Binance (напр. /rate BTCUSDT)\n"
-        "• /alarm SYMBOL INTERVAL — періодичні сповіщення (напр. /alarm ENSUSDT 30m)\n"
+        "• /rate SYMBOL — показати поточний funding з Binance\n"
+        "   приклади: /rate BTCUSDT, /rate ENSUSDT\n"
+        "• /alarm SYMBOL INTERVAL — надсилати funding регулярно\n"
+        "   приклади: /alarm ENSUSDT 30m, /alarm BTCUSDT 1h, /alarm ETHUSDT 45s\n"
         "• /stopalarm [SYMBOL] — зупинити всі або конкретний аларм\n"
-        "\nІнтервали: 10s, 30m, 1h\n"
+        "\nФормати інтервалів: 10s, 30m, 1h\n"
     )
     await update.message.reply_text(text)
 
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
+
 
 async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -77,7 +82,8 @@ async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.exception("rate_cmd error")
         await update.message.reply_text(f"Помилка: {e}")
 
-# ----- alarm -----
+
+# ---------- АЛАРМИ ----------
 async def alarm_tick(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     symbol = context.job.data["symbol"]
@@ -92,6 +98,7 @@ async def alarm_tick(context: ContextTypes.DEFAULT_TYPE):
         logging.exception("alarm_tick error")
         await context.bot.send_message(chat_id, f"Помилка отримання funding для {symbol}: {e}")
 
+
 async def alarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text("Використання: /alarm SYMBOL INTERVAL (напр. /alarm BTCUSDT 30m)")
@@ -104,7 +111,7 @@ async def alarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     jq = context.application.job_queue
     name = f"{update.effective_chat.id}:{symbol}"
-    # прибираємо попередній, якщо був
+    # при повторному запуску — замінюємо
     for j in jq.get_jobs_by_name(name):
         j.schedule_removal()
 
@@ -118,6 +125,7 @@ async def alarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(f"✅ Запущено аларм для {symbol} кожні {context.args[1]}.\nЗупинка: /stopalarm {symbol}")
 
+
 async def stopalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jq = context.application.job_queue
     if context.args:
@@ -128,7 +136,6 @@ async def stopalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             j.schedule_removal()
         msg = f"🛑 Зупинено аларм для {symbol}." if jobs else f"Не знайдено активного аларму для {symbol}."
     else:
-        # зупинити всі для цього чату
         cnt = 0
         for j in list(jq.jobs()):
             if j.name and str(update.effective_chat.id) in j.name:
@@ -137,7 +144,8 @@ async def stopalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"🛑 Зупинено {cnt} аларм(и)." if cnt else "Активних алармів не знайдено."
     await update.message.reply_text(msg)
 
-# ---------- Telegram runtime (без run_polling) ----------
+
+# ---------- TELEGRAM-БОТ (без run_polling) ----------
 async def run_telegram_app():
     if not TELEGRAM_TOKEN:
         raise SystemExit("TELEGRAM_TOKEN не задано в .env/Env Vars")
@@ -152,9 +160,10 @@ async def run_telegram_app():
     await app.start()
     await app.updater.start_polling()
     logging.info("✅ Telegram bot started (polling).")
-    await asyncio.Future()  # ніколи не завершується
+    await asyncio.Future()  # не завершується
 
-# ---------- Простий веб-сервер для Render ----------
+
+# ---------- ВЕБ-СЕРВЕР ДЛЯ RENDER ----------
 async def run_web_server():
     async def ok(_):
         return web.Response(text="OK")
@@ -162,21 +171,21 @@ async def run_web_server():
     webapp.router.add_get("/", ok)
     webapp.router.add_get("/healthz", ok)
 
-    # PORT має бути заданий Render'ом; не ставимо дефолт
-    port = int(os.environ["PORT"])
+    port = int(os.environ["PORT"])  # Render задає PORT
     runner = web.AppRunner(webapp)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"✅ Web server is listening on 0.0.0.0:{port}")
-    await asyncio.Future()  # ніколи не завершується
+    await asyncio.Future()  # не завершується
 
-# ---------- Головний запуск ----------
+
+# ---------- ГОЛОВНИЙ ЗАПУСК ----------
 async def main():
-    # 1) Спочатку піднімаємо веб-сервер, щоб Render побачив порт
+    # Спочатку підіймаємо веб-сервер, щоб Render одразу побачив відкритий порт
     web_task = asyncio.create_task(run_web_server())
     await asyncio.sleep(1)
-    # 2) Потім запускаємо Telegram-бота
+    # Потім запускаємо Telegram-бота
     await run_telegram_app()
     await web_task
 
