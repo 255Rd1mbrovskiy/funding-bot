@@ -27,9 +27,12 @@ BINANCE_PREMIUM = "https://fapi.binance.com/fapi/v1/premiumIndex"
 FUTURES_24H     = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 EXCHANGE_INFO   = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 
-# ---------- STATE (антизасинання + валідні символи) ----------
+# ---------- STATE (антизасинання + анти-дубль старт) ----------
 _bot_task: asyncio.Task | None = None
 _bot_started: bool = False
+_starting: bool = False
+_start_lock = asyncio.Lock()
+
 _futures_symbols: set[str] = set()  # PERPETUAL & TRADING
 
 # ---------- ВАЛІДАЦІЯ СИМВОЛІВ (PERPETUAL) ----------
@@ -111,13 +114,17 @@ async def notify_admin_startup(app):
         pass
 
 async def ensure_bot_running():
-    """Стартує polling, якщо він ще не піднятий (або впав)."""
-    global _bot_task, _bot_started
-    if _bot_task and not _bot_task.done():
-        return "running"
-    _bot_started = False
-    _bot_task = asyncio.create_task(run_telegram_app())
-    return "starting"
+    """Стартує polling, якщо він ще не піднятий (або впав). Захист від дубль-стартів."""
+    global _bot_task, _bot_started, _starting
+    async with _start_lock:
+        if _bot_task and not _bot_task.done():
+            return "running"
+        if _starting:
+            return "starting"
+        _starting = True
+        _bot_started = False
+        _bot_task = asyncio.create_task(run_telegram_app())
+        return "starting"
 
 # ---------- ГЛОБАЛЬНИЙ ERROR-HANDLER ----------
 async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,7 +295,7 @@ async def stopalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- TELEGRAM RUNTIME ----------
 async def run_telegram_app():
-    global _bot_started
+    global _bot_started, _starting
     if not TELEGRAM_TOKEN:
         raise SystemExit("TELEGRAM_TOKEN не задано в .env/Env Vars")
 
@@ -306,8 +313,19 @@ async def run_telegram_app():
     app.add_handler(CommandHandler("stopalarm", stopalarm_cmd))
 
     await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+
+    # на випадок гонки стартів — кілька спроб із паузою
+    for attempt in range(3):
+        try:
+            await app.start()
+            await app.updater.start_polling()
+            break
+        except TelegramError as e:
+            if "Conflict" in str(e):
+                logging.warning("Polling Conflict on start, retrying...")
+                await asyncio.sleep(5)
+                continue
+            raise
     logging.info("✅ Telegram bot started (polling).")
 
     # валідні символи та оновлення раз на 6 год
@@ -320,6 +338,7 @@ async def run_telegram_app():
     )
 
     _bot_started = True
+    _starting = False
     await notify_admin_startup(app)
 
     await asyncio.Future()  # не завершується
@@ -332,7 +351,7 @@ async def run_web_server():
         return web.Response(text=f"OK ({state})")
 
     async def health(_):
-        state = "started" if _bot_started else "starting"
+        state = "started" if _bot_started else ("starting" if _starting else "stopped")
         return web.json_response({"status": state})
 
     webapp = web.Application()
