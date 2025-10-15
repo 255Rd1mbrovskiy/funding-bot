@@ -10,6 +10,7 @@ from aiohttp import web, ClientResponseError
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.error import TelegramError
 
 # ---------- LOGGING & ENV ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -26,13 +27,12 @@ BINANCE_PREMIUM = "https://fapi.binance.com/fapi/v1/premiumIndex"
 FUTURES_24H     = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 EXCHANGE_INFO   = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 
-# ---------- STATE (для антизасинання) ----------
+# ---------- STATE (антизасинання + валідні символи) ----------
 _bot_task: asyncio.Task | None = None
 _bot_started: bool = False
-
-# ---------- ВАЛІДАЦІЯ СИМВОЛІВ (PERPETUAL) ----------
 _futures_symbols: set[str] = set()  # PERPETUAL & TRADING
 
+# ---------- ВАЛІДАЦІЯ СИМВОЛІВ (PERPETUAL) ----------
 async def load_futures_symbols():
     """Качає список валідних ф’ючерсних символів у кеш."""
     global _futures_symbols
@@ -119,6 +119,30 @@ async def ensure_bot_running():
     _bot_task = asyncio.create_task(run_telegram_app())
     return "starting"
 
+# ---------- ГЛОБАЛЬНИЙ ERROR-HANDLER ----------
+async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        logging.exception("Unhandled error in handler", exc_info=context.error)
+        if update and update.effective_chat:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "⚠️ Сталася технічна помилка під час обробки команди. Спробуй ще раз."
+            )
+    except TelegramError:
+        pass
+
+# ---------- WATCHDOG ----------
+async def watchdog():
+    # раз на хвилину перевіряємо, що polling живий; якщо ні — піднімаємо
+    while True:
+        try:
+            if not _bot_started or (_bot_task and _bot_task.done()):
+                logging.warning("Watchdog: polling not running -> restarting...")
+                await ensure_bot_running()
+        except Exception as e:
+            logging.warning(f"Watchdog error: {e}")
+        await asyncio.sleep(60)
+
 # ---------- КОМАНДИ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -129,6 +153,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /alarm SYMBOL INTERVAL — надсилати funding регулярно\n"
         "   приклади: /alarm ENSUSDT 30m, /alarm BTCUSDT 1h, /alarm ETHUSDT 45s\n"
         "• /stopalarm [SYMBOL] — зупинити всі або конкретний аларм\n"
+        "• /ping — діагностика (стан бота)\n"
         "\nФормати інтервалів: 10s, 30m, 1h\n"
         "⚠️ Перевіряємо саме Binance Futures (PERPETUAL). Якщо монета лише на Spot — фандінгу немає."
     )
@@ -136,6 +161,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
+
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"pong | polling={'on' if _bot_started else 'off'} | symbols={len(_futures_symbols)}"
+    )
 
 async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -263,8 +293,14 @@ async def run_telegram_app():
         raise SystemExit("TELEGRAM_TOKEN не задано в .env/Env Vars")
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # error handler
+    app.add_error_handler(on_error)
+
+    # handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("rate", rate_cmd))
     app.add_handler(CommandHandler("alarm", alarm_cmd))
     app.add_handler(CommandHandler("stopalarm", stopalarm_cmd))
@@ -274,7 +310,7 @@ async def run_telegram_app():
     await app.updater.start_polling()
     logging.info("✅ Telegram bot started (polling).")
 
-    # завантажити валідні символи та оновлювати їх раз на 6 год
+    # валідні символи та оновлення раз на 6 год
     await load_futures_symbols()
     app.job_queue.run_repeating(
         lambda c: asyncio.create_task(load_futures_symbols()),
@@ -318,6 +354,8 @@ async def main():
     await asyncio.sleep(0.5)
     # 2) Одразу гарантуємо підняття бота
     await ensure_bot_running()
+    # 3) Сторож, який контролить polling
+    asyncio.create_task(watchdog())
     await web_task
 
 if __name__ == "__main__":
