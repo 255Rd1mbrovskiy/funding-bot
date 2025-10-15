@@ -11,19 +11,24 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ---------- ЛОГИ + ТОКЕН ----------
+# ---------- LOGGING & ENV ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-# приглушимо шум від сторонніх бібліотек
+# приглушимо балакучі логи сторонніх бібліотек
 for name in ["telegram", "telegram.ext", "httpx", "aiohttp", "urllib3", "asyncio"]:
     logging.getLogger(name).setLevel(logging.WARNING)
 
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")  # опц.: твій Telegram user id для нотифікацій
 
 # ---------- ENDPOINTS ----------
 BINANCE_PREMIUM = "https://fapi.binance.com/fapi/v1/premiumIndex"
 FUTURES_24H     = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 EXCHANGE_INFO   = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+
+# ---------- STATE (для антизасинання) ----------
+_bot_task: asyncio.Task | None = None
+_bot_started: bool = False
 
 # ---------- ВАЛІДАЦІЯ СИМВОЛІВ (PERPETUAL) ----------
 _futures_symbols: set[str] = set()  # PERPETUAL & TRADING
@@ -68,7 +73,7 @@ def parse_interval(text: str) -> int | None:
 async def fetch_binance(symbol: str):
     """
     Повертає: (SYMBOL, funding_rate_decimal, next_dt_kyiv, mark_price)
-    Ловить 400/429/5xx і кидає читабельне виключення.
+    Ловить 400/429/5xx і повертає читабельну помилку.
     """
     params = {"symbol": symbol.upper()}
     async with aiohttp.ClientSession() as s:
@@ -77,20 +82,17 @@ async def fetch_binance(symbol: str):
                 r.raise_for_status()
                 data = await r.json()
         except ClientResponseError as e:
-            # 400 зазвичай буває при невалідному символі або недоступному інструменті
             if e.status == 400:
                 raise ValueError("Binance відповів 400 (Bad Request) — ймовірно, символ не підтримується на Futures.") from e
             raise
     rate = float(data.get("lastFundingRate") or data.get("fundingRate") or 0.0)
-    # Київ = UTC+3 (спрощено, без zoneinfo)
+    # Київ = UTC+3 (спрощено без zoneinfo)
     next_dt = datetime.fromtimestamp(int(data["nextFundingTime"]) / 1000, tz=timezone.utc) + timedelta(hours=3)
     mark_price = float(data.get("markPrice") or 0.0)
     return symbol.upper(), rate, next_dt, mark_price
 
 async def fetch_futures_24h(symbol: str):
-    """
-    Повертає: (last_price, change_pct) для USDT-маржин ф’ючерсів.
-    """
+    """Повертає: (last_price, change_pct) для USDT-маржин ф’ючерсів."""
     params = {"symbol": symbol.upper()}
     async with aiohttp.ClientSession() as s:
         async with s.get(FUTURES_24H, params=params, timeout=12) as r:
@@ -99,6 +101,23 @@ async def fetch_futures_24h(symbol: str):
     last = float(data.get("lastPrice") or 0.0)
     chg = float(data.get("priceChangePercent") or 0.0)  # у відсотках
     return last, chg
+
+async def notify_admin_startup(app):
+    if not ADMIN_ID:
+        return
+    try:
+        await app.bot.send_message(int(ADMIN_ID), "✅ Bot started (Render wake/redeploy).")
+    except Exception:
+        pass
+
+async def ensure_bot_running():
+    """Стартує polling, якщо він ще не піднятий (або впав)."""
+    global _bot_task, _bot_started
+    if _bot_task and not _bot_task.done():
+        return "running"
+    _bot_started = False
+    _bot_task = asyncio.create_task(run_telegram_app())
+    return "starting"
 
 # ---------- КОМАНДИ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -146,10 +165,9 @@ async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"24h: {arrow} {chg:.2f}%"
         )
     except ValueError as e:
-        # наш дружній текст при 400 Bad Request тощо
         await update.message.reply_text(
-            f"⚠️ {e}\n(Символ '{symbol}' є у списку PERPETUAL? Спробуй близький: "
-            f"{hint or 'наприклад BTCUSDT'})"
+            f"⚠️ {e}\n(Символ '{symbol}' є у списку PERPETUAL? "
+            f"Спробуй близький: {hint or 'наприклад BTCUSDT'})"
         )
     except Exception as e:
         logging.exception("rate_cmd error")
@@ -174,7 +192,6 @@ async def alarm_tick(context: ContextTypes.DEFAULT_TYPE):
             f"24h: {arrow} {chg:.2f}%"
         )
     except Exception as e:
-        # не вбиваємо бота, просто повідомляємо й логуюємо
         logging.exception("alarm_tick error")
         try:
             await context.bot.send_message(chat_id, f"⚠️ Помилка під час оновлення {symbol}: {e}")
@@ -239,8 +256,9 @@ async def stopalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.info(f"All alarms stopped: chat={update.effective_chat.id}, count={cnt}")
     await update.message.reply_text(msg)
 
-# ---------- TELEGRAM-БОТ ----------
+# ---------- TELEGRAM RUNTIME ----------
 async def run_telegram_app():
+    global _bot_started
     if not TELEGRAM_TOKEN:
         raise SystemExit("TELEGRAM_TOKEN не задано в .env/Env Vars")
 
@@ -265,15 +283,25 @@ async def run_telegram_app():
         name="refresh_symbols"
     )
 
+    _bot_started = True
+    await notify_admin_startup(app)
+
     await asyncio.Future()  # не завершується
 
-# ---------- ВЕБ-СЕРВЕР ДЛЯ RENDER ----------
+# ---------- WEB SERVER (Render) ----------
 async def run_web_server():
     async def ok(_):
-        return web.Response(text="OK")
+        # Будимо бота, якщо він не запущений
+        state = await ensure_bot_running()
+        return web.Response(text=f"OK ({state})")
+
+    async def health(_):
+        state = "started" if _bot_started else "starting"
+        return web.json_response({"status": state})
+
     webapp = web.Application()
     webapp.router.add_get("/", ok)
-    webapp.router.add_get("/healthz", ok)
+    webapp.router.add_get("/healthz", health)
 
     port = int(os.environ["PORT"])  # Render задає PORT
     runner = web.AppRunner(webapp)
@@ -283,13 +311,13 @@ async def run_web_server():
     logging.info(f"✅ Web server is listening on 0.0.0.0:{port}")
     await asyncio.Future()  # не завершується
 
-# ---------- ГОЛОВНИЙ ЗАПУСК ----------
+# ---------- MAIN ----------
 async def main():
-    # 1) Спочатку підіймаємо веб-сервер, щоб Render одразу побачив порт
+    # 1) Спочатку підіймаємо веб-сервер (щоб Render одразу побачив порт)
     web_task = asyncio.create_task(run_web_server())
-    await asyncio.sleep(1)
-    # 2) Потім запускаємо Telegram-бота
-    await run_telegram_app()
+    await asyncio.sleep(0.5)
+    # 2) Одразу гарантуємо підняття бота
+    await ensure_bot_running()
     await web_task
 
 if __name__ == "__main__":
